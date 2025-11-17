@@ -1,182 +1,160 @@
-# backend/app/services/qa_engine.py
-from app.services.summarizer import chunk_text
-from app.models import AnalysisReport
-from pathlib import Path
-import json
+"""RAG-based question-answering engine using FAISS and Vertex AI."""
 import os
+import asyncio
+from typing import List, Optional
+from pathlib import Path
 from langchain_google_vertexai import ChatVertexAI
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
-from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from app.services.extractor import load_extracted_text
+from app.config import (
+    VECTOR_STORE_DIR,
+    EMBEDDINGS_MODEL_NAME,
+    GEMINI_MODEL_NAME,
+    VERTEX_AI_LOCATION,
+    GOOGLE_CLOUD_PROJECT
+)
 
-# Lazy loading of embedding model to avoid startup issues
-EMBED_MODEL = None
 
-def get_embed_model():
-    global EMBED_MODEL
-    if EMBED_MODEL is None:
+# Initialize embeddings
+try:
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDINGS_MODEL_NAME)
+except Exception as e:
+    print(f"Warning: Could not load embeddings model: {e}")
+    embeddings = None
+
+
+def get_or_create_vector_store(doc_ids: List[str]) -> Optional[FAISS]:
+    """Get or create a FAISS vector store for the given documents."""
+    if embeddings is None:
+        return None
+    
+    # Create a combined store name from all doc IDs
+    store_name = "_".join(sorted(doc_ids))
+    store_path = VECTOR_STORE_DIR / f"{store_name}.faiss"
+    
+    # Try to load existing store
+    if store_path.exists() and (VECTOR_STORE_DIR / f"{store_name}.pkl").exists():
         try:
-            EMBED_MODEL = HuggingFaceEmbeddings(
-                model_name="nlpaueb/legal-bert-base-uncased",
-                model_kwargs={"device": "cpu"},
-                encode_kwargs={"normalize_embeddings": True, "batch_size": 64},
+            return FAISS.load_local(
+                str(VECTOR_STORE_DIR),
+                embeddings,
+                allow_dangerous_deserialization=True,
+                index_name=store_name
             )
         except Exception as e:
-            print(f"Failed to load embedding model: {e}")
-            # Fallback to a simpler model
-            EMBED_MODEL = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/all-MiniLM-L6-v2",
-                model_kwargs={"device": "cpu"},
-            )
-    return EMBED_MODEL
-
-from collections import defaultdict, deque
-
-# In-memory user chat history (user_id -> deque of last 10 queries)
-USER_CHAT_HISTORY = defaultdict(lambda: deque(maxlen=10))
-
-# New: Chat with all documents for a user
-async def chat_with_documents(doc_ids, query, user_id=None):
+            print(f"Error loading vector store: {e}")
+    
+    # Create new vector store
+    all_texts = []
+    for doc_id in doc_ids:
+        text = load_extracted_text(doc_id)
+        if text:
+            all_texts.append(text)
+    
+    if not all_texts:
+        return None
+    
+    # Combine all texts
+    combined_text = "\n\n---DOCUMENT SEPARATOR---\n\n".join(all_texts)
+    
+    # Split text into chunks
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len,
+    )
+    chunks = text_splitter.split_text(combined_text)
+    
+    if not chunks:
+        return None
+    
+    # Create vector store
     try:
-        # Store the query in user history
-        if user_id:
-            USER_CHAT_HISTORY[user_id].append(query)
-            # Build context from last 10 queries
-            memory_context = "\n".join(USER_CHAT_HISTORY[user_id])
-        else:
-            memory_context = query
+        vector_store = FAISS.from_texts(chunks, embeddings)
         
-        # Get cache and data directories from environment
-        cache_dir = os.environ.get("CACHE_DIR", "/tmp/cache")
-        data_dir = os.environ.get("DATA_DIR", "/tmp/data")
+        # Save vector store
+        vector_store.save_local(
+            str(VECTOR_STORE_DIR),
+            index_name=store_name
+        )
         
-        # Ensure directories exist
-        Path(cache_dir).mkdir(parents=True, exist_ok=True)
-        Path(data_dir).mkdir(parents=True, exist_ok=True)
+        return vector_store
+    except Exception as e:
+        print(f"Error creating vector store: {e}")
+        return None
+
+
+def get_qa_prompt(query: str, context: str) -> str:
+    """Generate the prompt for question answering."""
+    return f"""You are a helpful legal document assistant. Answer the user's question based on the following document context.
+
+Document Context:
+{context}
+
+User Question: {query}
+
+Provide a clear, concise, and accurate answer based solely on the document context provided. If the context doesn't contain enough information to answer the question, say so. Do not make up information.
+
+Answer:"""
+
+
+def _chat_with_documents_sync(doc_ids: List[str], query: str) -> str:
+    """
+    Synchronous implementation of chat with documents.
+    
+    Args:
+        doc_ids: List of document IDs to search
+        query: User's question
         
-        all_context = []
-        for doc_id in doc_ids:
-            cache_path = Path(cache_dir) / f"extract_{doc_id}.txt"
-            if not cache_path.exists():
-                continue
-            text = cache_path.read_text(encoding="utf-8")
-            emb = get_embed_model()  # Use lazy-loaded model
-            vs_path = Path(data_dir) / f"vs_hf-legal-bert_{doc_id}"
-            if vs_path.exists():
-                store = FAISS.load_local(vs_path.as_posix(), emb, allow_dangerous_deserialization=True)
-            else:
-                from langchain.text_splitter import RecursiveCharacterTextSplitter
-                splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-                docs = splitter.create_documents([text])
-                docs = [d for d in docs if len(d.page_content.strip()) >= 40]
-                store = FAISS.from_documents(docs, emb)
-                store.save_local(vs_path.as_posix())
-            results = store.similarity_search_with_score(memory_context, k=3)
-            context = "\n\n".join([doc.page_content.strip() for doc, score in results if score >= 0.2])
-            if context:
-                all_context.append(context)
-        combined_context = "\n\n".join(all_context)
-        if not combined_context:
-            return "No relevant information found in your documents."
+    Returns:
+        str: The AI's answer
+    """
+    if not doc_ids:
+        return "No documents available to answer your question."
+    
+    try:
+        # Get or create vector store
+        vector_store = get_or_create_vector_store(doc_ids)
+        if vector_store is None:
+            return "Error: Could not create vector store from documents. Please ensure documents are properly processed."
         
-        # Set credentials if not already set
-        if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(Path(__file__).parent.parent.parent / "legal-firebase.json")
+        # Perform similarity search
+        docs = vector_store.similarity_search(query, k=3)
         
+        # Combine context from retrieved documents
+        context = "\n\n".join([doc.page_content for doc in docs])
+        
+        # Initialize LLM
         llm = ChatVertexAI(
-            model="gemini-2.5-flash-lite",
-            temperature=0.1,
-            max_output_tokens=1024,
-            top_p=0.95,
-            top_k=40,
-            project="legal-470807",
+            model_name=GEMINI_MODEL_NAME,
+            location=VERTEX_AI_LOCATION,
+            project=GOOGLE_CLOUD_PROJECT if GOOGLE_CLOUD_PROJECT else None,
+            temperature=0.3,
+            max_output_tokens=2048,
         )
-        # Only answer the last query, but use history for context
-        last_query = query if not user_id else USER_CHAT_HISTORY[user_id][-1] if USER_CHAT_HISTORY[user_id] else query
-        prompt = PromptTemplate(
-            input_variables=["context", "question"],
-            template=(
-                "You are a legal assistant AI specialized in simplifying complex legal documents. "
-                "Your role is to help users understand rental agreements, loan contracts, terms of service, "
-                "and other legal documents by providing clear summaries, explaining complex clauses, "
-                "and answering questions in simple, practical language.\n\n"
-                "CONTEXT:\n{context}\n\nQUESTION:\n{question}\n\nAnswer concisely and only to the last question."
-            ),
-        )
-        chain = LLMChain(llm=llm, prompt=prompt)
-        resp = chain.invoke({"context": combined_context, "question": last_query})
-        if hasattr(resp, "content"):
-            out = resp.content
-        elif isinstance(resp, dict) and "text" in resp:
-            out = resp["text"]
-        else:
-            out = str(resp)
-        return out
+        
+        # Generate answer
+        prompt = get_qa_prompt(query, context)
+        response = llm.invoke(prompt)
+        
+        return response.content if hasattr(response, 'content') else str(response)
     except Exception as e:
         print(f"Error in chat_with_documents: {e}")
-        return f"Sorry, I encountered an error while processing your request: {str(e)}"
+        return f"Sorry, I encountered an error while processing your question: {str(e)}"
 
-async def chat_with_document(doc_id: str, query: str):
-    try:
-        # Get cache and data directories from environment
-        cache_dir = os.environ.get("CACHE_DIR", "/tmp/cache")
-        data_dir = os.environ.get("DATA_DIR", "/tmp/data")
+
+async def chat_with_documents(doc_ids: List[str], query: str) -> str:
+    """
+    Answer a question using RAG with the given documents (async wrapper).
+    
+    Args:
+        doc_ids: List of document IDs to search
+        query: User's question
         
-        # Ensure directories exist
-        Path(cache_dir).mkdir(parents=True, exist_ok=True)
-        Path(data_dir).mkdir(parents=True, exist_ok=True)
-        
-        cache_path = Path(cache_dir) / f"extract_{doc_id}.txt"
-        if not cache_path.exists():
-            raise FileNotFoundError("Document not found in cache.")
-        text = cache_path.read_text(encoding="utf-8")
-        # Build vector store
-        emb = get_embed_model()  # Use lazy-loaded model
-        vs_path = Path(data_dir) / f"vs_hf-legal-bert_{doc_id}"
-        if vs_path.exists():
-            store = FAISS.load_local(vs_path.as_posix(), emb, allow_dangerous_deserialization=True)
-        else:
-            from langchain.text_splitter import RecursiveCharacterTextSplitter
-            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-            docs = splitter.create_documents([text])
-            docs = [d for d in docs if len(d.page_content.strip()) >= 40]
-            store = FAISS.from_documents(docs, emb)
-            store.save_local(vs_path.as_posix())
-        # Search relevant chunks
-        results = store.similarity_search_with_score(query, k=5)
-        context = "\n\n".join([doc.page_content.strip() for doc, score in results if score >= 0.2])
-        # RAG prompt
-        if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(Path(__file__).parent.parent.parent / "legal-firebase.json")
-        llm = ChatVertexAI(
-            model="gemini-2.5-flash-lite",
-            temperature=0.1,
-            max_output_tokens=1024,
-            top_p=0.95,
-            top_k=40,
-            project="legal-470807",
-        )
-        prompt = PromptTemplate(
-            input_variables=["context", "question"],
-            template=(
-                "You are a legal assistant AI specialized in simplifying complex legal documents. "
-                "Your role is to help users understand rental agreements, loan contracts, terms of service, "
-                "and other legal documents by providing clear summaries, explaining complex clauses, "
-                "and answering questions in simple, practical language.\n\n"
-                "CONTEXT:\n{context}\n\nQUESTION: {question}\n\nAnswer:"
-            ),
-        )
-        chain = LLMChain(llm=llm, prompt=prompt)
-        resp = chain.invoke({"context": context, "question": query})
-        # Gemini returns an AIMessage object, get the text
-        if hasattr(resp, "content"):
-            out = resp.content
-        elif isinstance(resp, dict) and "text" in resp:
-            out = resp["text"]
-        else:
-            out = str(resp)
-        return out
-    except Exception as e:
-        print(f"Error in chat_with_document: {e}")
-        return f"Sorry, I encountered an error while processing your request: {str(e)}"
+    Returns:
+        str: The AI's answer
+    """
+    return await asyncio.to_thread(_chat_with_documents_sync, doc_ids, query)
+
